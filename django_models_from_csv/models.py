@@ -28,11 +28,11 @@ except ImportError:
 import django_models_from_csv
 from django_models_from_csv.fields import ColumnsField
 from django_models_from_csv.permissions import (
-    hydrate_models_and_permissions,
+    hydrate_models_and_permissions, wipe_models_and_permissions,
 )
 from django_models_from_csv.schema import ModelSchemaEditor, FieldSchemaEditor
 from django_models_from_csv.utils.common import get_setting, slugify
-from django_models_from_csv.utils.csv import fetch_csv
+from django_models_from_csv.utils.csv import fetch_csv, clean_csv_headers
 from django_models_from_csv.utils.google_sheets import (
    GoogleOAuth, PrivateSheetImporter
 )
@@ -98,6 +98,11 @@ class DynamicModel(models.Model):
     sd_api_key = models.CharField(max_length=100, null=True, blank=True)
     sd_project_id = models.IntegerField(null=True, blank=True)
     sd_form_id = models.IntegerField(null=True, blank=True)
+
+    # File upload storage
+    csv_file = models.FileField(
+        upload_to="csv_uploads/", blank=True,
+    )
 
     # some attributes (as dict) to distinguish dynamic models from
     # eachother, to drive some business logic, etc. not used internally.
@@ -213,6 +218,8 @@ class DynamicModel(models.Model):
             csv = importer.build_csv(
                 self.sd_project_id, form_id=self.sd_form_id
             )
+        elif self.csv_file:
+            csv = self.csv_file.read().decode("utf-8")
         else:
             raise NotImplementedError("Invalid data source for %s" % self)
 
@@ -288,9 +295,17 @@ class DynamicModel(models.Model):
             fn(self)
 
     def delete(self, **kwargs):
+        # first drop the table, we have to do this first, else
+        # django will complain about no content type existing
         Model = apps.get_model("django_models_from_csv", self.name)
         ModelSchemaEditor().drop_table(Model)
+
+        # then remove django app and content-types/permissions
         self.unregister_model(self.name)
+        app_config = apps.get_app_config("django_models_from_csv")
+        wipe_models_and_permissions(app_config, self.name)
+
+        # finally kill the row
         super().delete(**kwargs)
 
 

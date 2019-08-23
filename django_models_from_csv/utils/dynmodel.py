@@ -2,6 +2,7 @@ from functools import wraps
 import logging
 import re
 import string
+from io import StringIO
 
 from django.contrib.auth.models import User
 from django.db import connections, transaction
@@ -13,7 +14,7 @@ from django_models_from_csv.exceptions import (
     UniqueColumnError, DataSourceExistsError
 )
 from django_models_from_csv.models import DynamicModel
-from django_models_from_csv.utils.common import get_setting
+from django_models_from_csv.utils.common import get_setting, slugify
 from django_models_from_csv.utils.csv import fetch_csv, clean_csv_headers
 from django_models_from_csv.utils.models_py import (
     fix_models_py, extract_field_declaration_args,
@@ -35,14 +36,22 @@ CSV_MODELS_TEMP_DB = get_setting(
 
 
 @transaction.atomic(using=CSV_MODELS_TEMP_DB)
-def execute_sql(sql):
+def execute_sql(sql, params=None):
     """
-    Run a SQL query against our secondary in-memory database.
+    Run a SQL query against our secondary in-memory database. Returns
+    the table name, if this was a CREATE TABLE command, otherwise just
+    returns None.
     """
     conn = connections[CSV_MODELS_TEMP_DB]
     cursor = conn.cursor()
-    cursor.execute(sql)
-    table_name = re.findall("CREATE TABLE ([^ ]+) \\(", sql)[0]
+    if params is None:
+        cursor.execute(sql)
+    else:
+        cursor.execute(sql, params)
+    matches = re.findall("CREATE TABLE ([^ ]+) \\(", sql)
+    if not matches:
+        return None
+    table_name = matches[0]
     return table_name
 
 
@@ -50,12 +59,9 @@ def require_unique_name(f):
     @wraps(f)
     def unique_name_wrapper(*args, **kwargs):
         name = args[0]
-        try:
-            DynamicModel.objects.get(name=name)
-        except DynamicModel.DoesNotExist as e:
-            return f(*args, **kwargs)
-        # if we're here, we have an existing model, throw error w/ help
-        raise DataSourceExistsError(name)
+        if DynamicModel.objects.filter(name=name).count():
+            raise DataSourceExistsError(name)
+        return f(*args, **kwargs)
     return unique_name_wrapper
 
 
@@ -120,7 +126,7 @@ def from_csv(name, csv_data, **kwargs):
     The model is given a specified name and is populated with the
     attributes found in kwargs.
     """
-    logger.debug("New model from CSV:\n %s" % csv_data)
+    logger.debug("New model from CSV:\n %s" % name)
     csv_precheck(csv_data)
     # build SQL from CSV
     sql = run_csvsql(csv_data)
@@ -131,9 +137,31 @@ def from_csv(name, csv_data, **kwargs):
     # build models.py from this DB
     models_py = run_inspectdb(table_name=table_name)
     logger.debug("models_py: %s" % models_py)
+    # # wipe the temporary table
+    # logger.debug("Dropping temporary table '%s'" % (table_name))
+    # execute_sql("DROP TABLE %s", [table_name])
     fixed_models_py = fix_models_py(models_py)
     logger.debug("fixed_models_py: %s" % fixed_models_py)
     return from_models_py(name, fixed_models_py, **kwargs)
+
+
+@require_unique_name
+def from_csv_file(filename, file):
+    """
+    Import a file from an upload, using its filename as the data
+    source name.
+    """
+    csv = clean_csv_headers(file.read().decode("utf-8"))
+    name = filename
+    no_ext = re.findall(r"^(.*)\.csv$", name)
+    if no_ext:
+        name = no_ext[0]
+    dynmodel = from_csv(slugify(name), csv)
+    fio = StringIO()
+    fio.write(csv)
+    dynmodel.csv_file.save(name, fio)
+    dynmodel.save()
+    return dynmodel
 
 
 @require_unique_name
