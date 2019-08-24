@@ -127,6 +127,7 @@ class DynamicModel(models.Model):
         clear_url_caches()
         return super().__new__(cls)
 
+
     def __init__(self, *args, **kwargs):
         """
         Initialize the schema editor with the currently registered model and the
